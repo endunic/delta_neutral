@@ -1,0 +1,13 @@
+# Core Application Dependencies
+fastapi
+uvicorn
+pydantic
+ccxt
+
+# Data & Math
+pandas
+numpy
+
+# HTTP & Web Automation
+httpx
+playwright

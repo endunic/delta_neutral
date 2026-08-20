@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Local secrets — credentials are provided via Koyeb env vars instead
+.env
+deribit_demo_keys.sh
+
+# Editor / IDE
+.vscode/
+
+# Logs & runtime artifacts
+logs/
+
+# Git history
+.git/
+.history/
