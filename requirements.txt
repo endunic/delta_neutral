@@ -3,6 +3,7 @@ fastapi
 uvicorn
 pydantic
 ccxt
+python-dotenv
 
 # Data & Math
 pandas
