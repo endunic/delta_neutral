@@ -412,14 +412,48 @@ if __name__ == "__main__":
     # Stage 5 unwind before the container is recycled.
     # ---------------------------------------------------------------------------
     CYCLE_COOLDOWN_SECONDS = 60  # pause between completed cycles to respect API rate limits
+    # Cap the number of full trading cycles opened per UTC day to avoid over-trading
+    # on the Deribit testnet. The counter resets at the start of each UTC day.
+    MAX_CYCLES_PER_DAY = 5
 
     logger.info("=========================================================================================")
     logger.info("                  DELTA_NEUTRAL 24/7 WORKER STARTED — AUTO-RESTART ENABLED                 ")
+    logger.info(f"                  DAILY CYCLE CAP: {MAX_CYCLES_PER_DAY} cycles / UTC day                     ")
     logger.info("=========================================================================================")
 
+    cycles_today = 0
+    current_utc_day = time.gmtime().tm_yday  # day-of-year; cheap, monotonic per UTC day
+
     while True:
+        # Reset the per-day cycle counter when the UTC day rolls over.
+        utc_day = time.gmtime().tm_yday
+        if utc_day != current_utc_day:
+            current_utc_day = utc_day
+            cycles_today = 0
+            logger.info("[*] New UTC day detected — daily cycle counter reset.")
+
+        if cycles_today >= MAX_CYCLES_PER_DAY:
+            # We've hit the daily cap. Sleep until the next UTC day rather than
+            # spinning the cooldown loop, so the bot still stays alive 24/7 but
+            # does not open new positions until the counter resets.
+            now = time.gmtime()
+            seconds_until_midnight_utc = (
+                (23 - now.tm_hour) * 3600
+                + (59 - now.tm_min) * 60
+                + (60 - now.tm_sec)
+            )
+            logger.info(f"[*] Daily cycle cap ({MAX_CYCLES_PER_DAY}) reached. "
+                        f"Pausing ~{seconds_until_midnight_utc}s until next UTC day before trading again.")
+            try:
+                time.sleep(seconds_until_midnight_utc)
+            except KeyboardInterrupt:
+                logger.warning("[!] KeyboardInterrupt during daily pause. Exiting worker loop.")
+                break
+            continue
+
         try:
             run_pipeline()
+            cycles_today += 1
         except KeyboardInterrupt:
             # A second Ctrl+C (or platform signal) should exit hard; otherwise
             # let run_pipeline's own handler do the graceful unwind and continue.
@@ -428,8 +462,8 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"[!] Pipeline crashed with uncaught error: {e}", exc_info=True)
 
-        logger.info(f"[*] Cycle complete. Cooling down for {CYCLE_COOLDOWN_SECONDS}s before the next "
-                    f"trading cycle...")
+        logger.info(f"[*] Cycle complete ({cycles_today}/{MAX_CYCLES_PER_DAY} today). "
+                    f"Cooling down for {CYCLE_COOLDOWN_SECONDS}s before the next trading cycle...")
         try:
             time.sleep(CYCLE_COOLDOWN_SECONDS)
         except KeyboardInterrupt:
