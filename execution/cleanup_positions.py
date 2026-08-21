@@ -49,11 +49,14 @@ def close_all_positions():
                 print(f"[!] Active Perp position found: {side.upper()} {contracts} {perp_symbol}")
 
                 close_side = 'buy' if side.lower() == 'short' else 'sell'
+                # CCXT reports short positions with a NEGATIVE contract count
+                # (e.g. -562.49). Deribit requires a positive float for the
+                # 'amount' field, so absolute-value it before submitting.
                 order = exchange.create_order(
                     symbol=perp_symbol,
                     type='market',
                     side=close_side,
-                    amount=contracts,
+                    amount=abs(contracts),
                     params={'reduceOnly': True}
                 )
                 print(f"[✓] Closed Perp position | Order ID: {order.get('id')}")
@@ -120,15 +123,24 @@ def close_all_positions():
             # If rejected due to max/min order quantity limits, parse the real
             # limit from the API payload and adapt to it instead of guessing.
             if "max_spot_order_quantity" in err_str or "11022" in err_str or "Invalid params" in err_str:
-                api_limit = _parse_exchange_limit(err_str)
-                if api_limit is not None and api_limit > 0:
-                    print(f" [!] Exchange reports order limit {api_limit} BNB. "
-                          f"Adapting chunk size: {current_chunk_size} -> {api_limit} BNB")
+                parsed = _parse_exchange_error(err_str)
+                api_limit = parsed.get('limit') if parsed else None
+                reason = parsed.get('reason') if parsed else None
+                if api_limit is not None and api_limit > 0 and current_chunk_size > api_limit:
+                    # Our chunk genuinely exceeds the maximum order size, so
+                    # shrink down to the reported ceiling.
+                    print(f" [!] Order exceeds exchange max ({api_limit} BNB). "
+                          f"Adapting chunk size: {current_chunk_size} -> {api_limit} BNB "
+                          f"(reason={reason})")
                     current_chunk_size = api_limit
                 else:
-                    # No parseable limit: fall back to halving, but keep a floor.
+                    # The payload's 'limit' is just the market's MAX (always 200.0
+                    # on testnet), NOT a suggestion to grow. A small order failing
+                    # means the real cause is elsewhere (sub-minimum, market state,
+                    # tick size, etc.). Halve the chunk and surface the reason.
                     new_chunk_size = max(current_chunk_size / 2.0, absolute_floor)
-                    print(f" [!] Exceeded exchange limit. Adapting chunk size: {current_chunk_size} -> {new_chunk_size:.5f} BNB")
+                    print(f" [!] Order rejected (reason={reason}, limit_meta={api_limit}). "
+                          f"Reducing chunk size: {current_chunk_size} -> {new_chunk_size:.5f} BNB")
                     current_chunk_size = new_chunk_size
 
                 consecutive_limit_failures += 1
@@ -154,17 +166,34 @@ def _parse_exchange_limit(err_str):
          "message":"max_spot_order_quantity"}, ...}
     Returns the limit as a float, or None if it cannot be parsed.
     """
+    result = _parse_exchange_error(err_str)
+    return result.get('limit') if result else None
+
+
+def _parse_exchange_error(err_str):
+    """Parse a Deribit JSON-RPC error payload into (limit, reason).
+
+    Important: Deribit's code 11022 / "max_spot_order_quantity" payload ALWAYS
+    carries the market's maximum spot order quantity as ``data.limit`` (e.g.
+    200.0) — even when the real rejection reason is something else entirely
+    (e.g. a sub-minimum quantity, an inactive market, or a price/tick issue).
+    Never assume ``data.limit`` is the size you should adopt; treat it only as an
+    upper ceiling. The ``data.reason`` field ("positive float required",
+    "minimum amount", etc.) is the authoritative signal for WHY the order was
+    rejected, so we surface it for diagnostics.
+    """
     try:
-        # Strip any leading traceback text to find the JSON object.
         match = re.search(r'\{.*\}', err_str, re.DOTALL)
         if not match:
             return None
         payload = json.loads(match.group(0))
         data = payload.get('error', {}).get('data', {})
         limit = data.get('limit')
-        if limit is None:
-            return None
-        return float(limit)
+        reason = data.get('reason') or payload.get('error', {}).get('message')
+        return {
+            'limit': float(limit) if limit is not None else None,
+            'reason': reason,
+        }
     except (ValueError, AttributeError, TypeError):
         return None
 

@@ -134,6 +134,33 @@ def _parse_exchange_limit(err_str):
         return None
 
 
+def _parse_exchange_error(err_str):
+    """Parse a Deribit JSON-RPC error payload into {'limit', 'reason'}.
+
+    Important: Deribit's code 11022 / "max_spot_order_quantity" payload ALWAYS
+    carries the market's maximum spot order quantity as ``data.limit`` (e.g.
+    200.0) — even when the real rejection reason is something else entirely
+    (e.g. a sub-minimum quantity, an inactive market, or a price/tick issue).
+    Never assume ``data.limit`` is the size you should adopt; treat it only as an
+    upper ceiling. The ``data.reason`` field is the authoritative signal for WHY
+    the order was rejected, so we surface it for diagnostics.
+    """
+    try:
+        match = re.search(r'\{.*\}', err_str, re.DOTALL)
+        if not match:
+            return None
+        payload = json.loads(match.group(0))
+        data = payload.get('error', {}).get('data', {})
+        limit = data.get('limit')
+        reason = data.get('reason') or payload.get('error', {}).get('message')
+        return {
+            'limit': float(limit) if limit is not None else None,
+            'reason': reason,
+        }
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
 def truncate_to_precision(exchange, symbol, amount):
     """Round an order amount DOWN to the market's amount precision.
 
@@ -234,20 +261,24 @@ def execute_atomic_unwind(exchange, context):
         except Exception as e:
             err_str = str(e)
             if "max_spot_order_quantity" in err_str or "11022" in err_str or "Invalid params" in err_str:
-                api_limit = _parse_exchange_limit(err_str)
-                if api_limit is not None and api_limit > 0:
-                    # Cap the adapted chunk size at the actual remaining balance to
-                    # avoid an infinite rejection loop when the exchange reports a
-                    # generic per-order limit (e.g. 200.0) that is larger than what
-                    # we still need to liquidate.
-                    capped_limit = min(api_limit, remaining)
-                    logger.warning(f"[!] Exchange reports order limit {api_limit} {spot_symbol.split('/')[0]}. "
-                                   f"Adapting chunk size: {chunk_size} -> {capped_limit}.")
-                    chunk_size = capped_limit
+                parsed = _parse_exchange_error(err_str)
+                api_limit = parsed.get('limit') if parsed else None
+                reason = parsed.get('reason') if parsed else None
+                if api_limit is not None and api_limit > 0 and chunk_size > api_limit:
+                    # Our chunk genuinely exceeds the maximum order size, so
+                    # shrink down to the reported ceiling.
+                    logger.warning(f"[!] Order exceeds exchange max ({api_limit} "
+                                   f"{spot_symbol.split('/')[0]}). Adapting chunk size: "
+                                   f"{chunk_size} -> {api_limit} (reason={reason}).")
+                    chunk_size = api_limit
                 else:
+                    # The payload's 'limit' is just the market's MAX (always 200.0
+                    # on testnet), NOT a suggestion to grow. A small order failing
+                    # means the real cause is elsewhere (sub-minimum, market state,
+                    # tick size, etc.). Halve the chunk and surface the reason.
                     new_chunk = max(chunk_size / 2.0, min_floor)
-                    logger.warning(f"[!] Exceeded exchange limit. Adapting chunk size: "
-                                   f"{chunk_size} -> {new_chunk:.5f}.")
+                    logger.warning(f"[!] Order rejected (reason={reason}, limit_meta={api_limit}). "
+                                   f"Reducing chunk size: {chunk_size} -> {new_chunk:.5f}.")
                     chunk_size = new_chunk
 
                 consecutive_limit_failures += 1
