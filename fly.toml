@@ -1,0 +1,22 @@
+# fly.toml app configuration file generated for delta-neutral on 2026-08-21T08:55:12+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'delta-neutral'
+primary_region = 'jnb'
+
+[build]
+
+# This is a long-running background worker (trading/scanner pipeline), not a
+# web server. We intentionally omit [http_service] so Fly does not try to
+# healthcheck/route traffic to port 8080.
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 1024

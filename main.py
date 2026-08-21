@@ -196,9 +196,14 @@ def execute_atomic_unwind(exchange, context):
             if "max_spot_order_quantity" in err_str or "11022" in err_str or "Invalid params" in err_str:
                 api_limit = _parse_exchange_limit(err_str)
                 if api_limit is not None and api_limit > 0:
+                    # Cap the adapted chunk size at the actual remaining balance to
+                    # avoid an infinite rejection loop when the exchange reports a
+                    # generic per-order limit (e.g. 200.0) that is larger than what
+                    # we still need to liquidate.
+                    capped_limit = min(api_limit, remaining)
                     logger.warning(f"[!] Exchange reports order limit {api_limit} {spot_symbol.split('/')[0]}. "
-                                   f"Adapting chunk size: {chunk_size} -> {api_limit}.")
-                    chunk_size = api_limit
+                                   f"Adapting chunk size: {chunk_size} -> {capped_limit}.")
+                    chunk_size = capped_limit
                 else:
                     new_chunk = max(chunk_size / 2.0, min_floor)
                     logger.warning(f"[!] Exceeded exchange limit. Adapting chunk size: "
