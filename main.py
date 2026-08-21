@@ -397,4 +397,41 @@ def run_pipeline(account_balance: float = None):
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    # ---------------------------------------------------------------------------
+    # 24/7 BACKGROUND WORKER LOOP
+    #
+    # Each iteration establishes a fresh delta-neutral hedge (Stage 1-3), monitors
+    # it for the 8-hour funding window or until the dynamic stop-loss / emergency
+    # unwind fires (Stage 4-5), then safely tears the position down. Once a cycle
+    # completes (whether by successful 8H payout capture or atomic unwind), the
+    # loop sleeps for a short cooldown and immediately starts the next cycle so
+    # the bot runs continuously without manual intervention.
+    #
+    # Platforms (Fly.io / Koyeb) keep this process alive as a long-running Worker;
+    # the SIGINT/SIGTERM handling inside run_pipeline() still triggers a clean
+    # Stage 5 unwind before the container is recycled.
+    # ---------------------------------------------------------------------------
+    CYCLE_COOLDOWN_SECONDS = 60  # pause between completed cycles to respect API rate limits
+
+    logger.info("=========================================================================================")
+    logger.info("                  DELTA_NEUTRAL 24/7 WORKER STARTED — AUTO-RESTART ENABLED                 ")
+    logger.info("=========================================================================================")
+
+    while True:
+        try:
+            run_pipeline()
+        except KeyboardInterrupt:
+            # A second Ctrl+C (or platform signal) should exit hard; otherwise
+            # let run_pipeline's own handler do the graceful unwind and continue.
+            logger.warning("[!] KeyboardInterrupt received at top level. Exiting worker loop.")
+            break
+        except Exception as e:
+            logger.error(f"[!] Pipeline crashed with uncaught error: {e}", exc_info=True)
+
+        logger.info(f"[*] Cycle complete. Cooling down for {CYCLE_COOLDOWN_SECONDS}s before the next "
+                    f"trading cycle...")
+        try:
+            time.sleep(CYCLE_COOLDOWN_SECONDS)
+        except KeyboardInterrupt:
+            logger.warning("[!] KeyboardInterrupt during cooldown. Exiting worker loop.")
+            break
