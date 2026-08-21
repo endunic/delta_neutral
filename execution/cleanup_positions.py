@@ -3,6 +3,7 @@ import os
 import time
 import json
 import re
+import math
 
 # Resolve project root and add to sys.path
 package_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -91,7 +92,10 @@ def close_all_positions():
 
             # Respect the exchange limit as a hard ceiling for a single chunk.
             chunk_qty = min(current_chunk_size, free_bnb)
-            chunk_qty = float(exchange.amount_to_precision(spot_symbol, chunk_qty))
+            # Truncate (round DOWN) so the order never exceeds the available
+            # balance after taker fees (e.g. 0.17982 BNB -> 0.17 BNB). Rounding
+            # up would cause Deribit to reject the spot sell with code 11022.
+            chunk_qty = truncate_to_precision(exchange, spot_symbol, chunk_qty)
 
             if chunk_qty < absolute_floor:
                 print(f"\n[!] Computed chunk size {chunk_qty} below minimum tradeable floor. "
@@ -163,6 +167,38 @@ def _parse_exchange_limit(err_str):
         return float(limit)
     except (ValueError, AttributeError, TypeError):
         return None
+
+
+def truncate_to_precision(exchange, symbol, amount):
+    """Round an order amount DOWN to the market's amount precision.
+
+    CCXT's ``amount_to_precision`` uses standard mathematical rounding, which can
+    round a balance-derived quantity UP (e.g. 0.17982 -> 0.18). When the quantity
+    originates from an actual free-balance read, rounding up produces an order
+    size larger than the available balance, and the exchange rejects it with an
+    ``Invalid params`` / ``max_spot_order_quantity`` (code 11022) error.
+
+    Truncating (rounding DOWN) guarantees the formatted quantity is always
+    ``<=`` the real balance, which makes spot liquidation orders reliably
+    acceptable while still leaving any sub-precision dust below the tradeable
+    floor.
+    """
+    try:
+        market = exchange.market(symbol)
+        precision = market.get('precision', {}).get('amount')
+    except Exception:
+        precision = None
+
+    if precision is None:
+        decimals = 2
+    elif isinstance(precision, float) or (isinstance(precision, str) and '.' in str(precision)):
+        decimals = max(0, int(round(-math.log10(float(precision)))))
+    else:
+        decimals = int(precision)
+
+    factor = 10 ** decimals
+    truncated = math.floor(float(amount) * factor) / factor
+    return float(exchange.amount_to_precision(symbol, truncated))
 
     print("=" * 60)
     print("[✓] Cleanup procedure complete. Exposure zeroed out.")

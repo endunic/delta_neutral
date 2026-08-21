@@ -10,6 +10,33 @@ MAX_SPOT_LIMIT = 190.0
 MAX_PERP_LIMIT = 1000.0
 
 
+def _truncate_to_precision(exchange, symbol, amount):
+    """Round an order amount DOWN to the market's amount precision.
+
+    CCXT's ``amount_to_precision`` uses standard mathematical rounding, which
+    can round a balance-derived quantity UP. When the quantity originates from
+    an actual free-balance read, rounding up produces an order size larger than
+    the available balance and the exchange rejects it (code 11022). Truncating
+    guarantees the formatted quantity is always <= the real balance.
+    """
+    try:
+        market = exchange.market(symbol)
+        precision = market.get('precision', {}).get('amount')
+    except Exception:
+        precision = None
+
+    if precision is None:
+        decimals = 2
+    elif isinstance(precision, float) or (isinstance(precision, str) and '.' in str(precision)):
+        decimals = max(0, int(round(-math.log10(float(precision)))))
+    else:
+        decimals = int(precision)
+
+    factor = 10 ** decimals
+    truncated = math.floor(float(amount) * factor) / factor
+    return float(exchange.amount_to_precision(symbol, truncated))
+
+
 def _wait_for_order_fill(exchange, order_id, symbol, max_retries=10, delay=1.0):
     """Polls an open order until filled or max retries reached."""
     for _ in range(max_retries):
@@ -118,7 +145,10 @@ def execute_atomic_unwind(exchange, spot_symbol, perp_symbol, total_quantity):
     try:
         for i in range(num_slices):
             current_chunk = min(slice_size, total_quantity - unwound_spot)
-            chunk_qty = float(exchange.amount_to_precision(spot_symbol, current_chunk))
+            # Truncate (round DOWN) so the spot sell never exceeds available
+            # balance after taker fees (e.g. 0.17982 BNB -> 0.17 BNB). Rounding
+            # up would cause Deribit to reject the spot sell with code 11022.
+            chunk_qty = _truncate_to_precision(exchange, spot_symbol, current_chunk)
 
             logger.info(f"--- [UNWIND SLICE {i+1}/{num_slices}] Size: {chunk_qty} BNB ---")
 

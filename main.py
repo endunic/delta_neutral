@@ -2,6 +2,7 @@ import time
 import sys
 import json
 import re
+import math
 import ccxt
 import config.settings as settings
 from core.logger import setup_logger
@@ -133,6 +134,42 @@ def _parse_exchange_limit(err_str):
         return None
 
 
+def truncate_to_precision(exchange, symbol, amount):
+    """Round an order amount DOWN to the market's amount precision.
+
+    CCXT's ``amount_to_precision`` uses standard mathematical rounding, which can
+    round a balance-derived quantity UP (e.g. 0.17982 -> 0.18). When the quantity
+    originates from an actual free-balance read, rounding up produces an order
+    size larger than the available balance, and the exchange rejects it with an
+    ``Invalid params`` / ``max_spot_order_quantity`` (code 11022) error.
+
+    Truncating (rounding DOWN) guarantees the formatted quantity is always
+    ``<=`` the real balance, which makes spot liquidation orders reliably
+    acceptable while still leaving any sub-precision dust to be reported as
+    below the tradeable floor.
+    """
+    try:
+        market = exchange.market(symbol)
+        precision = market.get('precision', {}).get('amount')
+    except Exception:
+        precision = None
+
+    # Deribit spot amounts are expressed as decimal places (e.g. 2). Some
+    # exchanges instead use a tick-size step (e.g. 0.01); handle both.
+    if precision is None:
+        decimals = 2
+    elif isinstance(precision, float) or (isinstance(precision, str) and '.' in str(precision)):
+        # tick-size style step (< 1): derive decimal places from it
+        decimals = max(0, int(round(-math.log10(float(precision)))))
+    else:
+        decimals = int(precision)
+
+    factor = 10 ** decimals
+    truncated = math.floor(float(amount) * factor) / factor
+    # Re-format through CCXT to respect any exchange-specific normalization.
+    return float(exchange.amount_to_precision(symbol, truncated))
+
+
 def execute_atomic_unwind(exchange, context):
     """
     STAGE 5: Emergency atomic unwind logic to close Perp Short and liquidate Spot Long.
@@ -176,7 +213,10 @@ def execute_atomic_unwind(exchange, context):
                 break
 
             qty = min(chunk_size, remaining, free_spot)
-            spot_size = float(exchange.amount_to_precision(spot_symbol, qty))
+            # Truncate (round DOWN) to avoid ordering more than the available
+            # balance after taker fees (e.g. 0.17982 BNB -> 0.17 BNB). Rounding
+            # up would cause Deribit to reject the spot sell with code 11022.
+            spot_size = truncate_to_precision(exchange, spot_symbol, qty)
             if spot_size < min_floor:
                 logger.warning(f"[!] Residual spot balance {free_spot:.4f} below tradeable floor; "
                                f"cannot liquidate via market order.")
